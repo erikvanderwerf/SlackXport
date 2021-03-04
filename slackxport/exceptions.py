@@ -1,0 +1,2 @@
+class SlackXportException(Exception):
+    pass
