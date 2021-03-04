@@ -1,6 +1,6 @@
 from pathlib import Path
 
-from slacksport.export import JsonSlackExport
+from slackxport import JsonSlackExport
 
 TOKEN = Path('TOKEN').read_text('utf-8').strip()
 export = JsonSlackExport(Path('export'), TOKEN)
