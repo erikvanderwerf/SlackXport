@@ -7,10 +7,12 @@ from pathlib import Path
 from re import Pattern
 from typing import Iterator, Union, List
 
+import requests
 import slack_sdk
+from ratelimit import limits, sleep_and_retry
 
 from slackxport.exceptions import SlackXportException
-from slackxport.slack import SlackConversation, SlackMessage
+from slackxport.slack import SlackConversation, SlackMessage, SlackFile
 
 __all__ = ["JsonSlackExport"]
 logger = logging.getLogger(__name__)
@@ -75,6 +77,7 @@ class JsonSlackExport:
     def __init__(self, root: Path, token: str, *, pull_if_not_found: bool = True):
         self.pull_if_not_found = pull_if_not_found
         self.root = root
+        self.token = token
         self.wc = slack_sdk.web.WebClient(
             token=token,
         )
@@ -97,11 +100,15 @@ class JsonSlackExport:
     def files_file(self) -> Path:
         return self.root / "files.json"
 
-    def conversations(self) -> Iterator[ExportedSlackConversation]:
-        if not self.conversations_file().exists() and self.pull_if_not_found:
-            self.pull_conversations(self.conversations_file)
+    def files_dir(self) -> Path:
+        return self.root / "files"
 
-        with open(self.conversations_file(), 'r') as fp:
+    def conversations(self) -> Iterator[ExportedSlackConversation]:
+        conversations_file = self.conversations_file()
+        if not conversations_file.exists() and self.pull_if_not_found:
+            self.pull_conversations(conversations_file)
+
+        with open(conversations_file, 'r') as fp:
             j = json.load(fp)
 
         for jc in j:
@@ -109,6 +116,23 @@ class JsonSlackExport:
             yield ExportedSlackConversation.of(
                 conversation,
                 root=self.conversation_dir(conversation)
+            )
+
+    def files(self) -> Iterator[SlackFile]:
+        files_file = self.files_file()
+        if not files_file.exists() and self.pull_if_not_found:
+            self.pull_files_meta(files_file)
+
+        with open(files_file, 'r') as fp:
+            fj = json.load(fp)
+
+        for f in fj:
+            # yield f
+            yield SlackFile(
+                file_id=f["id"],
+                filetype=os.path.splitext(f["name"])[1][1:] or f["filetype"] or f["mimetype"].split("/")[-1],
+                filename=f["name"],
+                url_private=f["url_private"]
             )
 
     def get_conversation_by_id(self, conversation_id: str) -> ExportedSlackConversation:
@@ -119,11 +143,12 @@ class JsonSlackExport:
             raise KeyError(conversation_id)
 
     def messages(self, conversation: ExportedSlackConversation) -> Iterator[SlackMessage]:
-        if not conversation.history_file().exists() and self.pull_if_not_found:
-            mj = self.pull_conversation_history(conversation, into=conversation.history_file())
-        else:
-            with open(conversation.history_file(), 'r') as fp:
-                mj = json.load(fp)
+        history_file = conversation.history_file()
+        if not history_file.exists() and self.pull_if_not_found:
+            self.pull_conversation_history(conversation, into=history_file)
+
+        with open(history_file, 'r') as fp:
+            mj = json.load(fp)
 
         m = None
         try:
@@ -140,11 +165,15 @@ class JsonSlackExport:
         self.pull_conversations(into=self.conversations_file())
         self.pull_users(into=self.users_file())
         self.pull_emojis(into=self.emojis_file())
-        self.pull_files(into=self.files_file())
+        self.pull_files_meta(into=self.files_file())
 
         conversations_dir = self.conversations_dir()
         conversations_dir.mkdir(exist_ok=True)
         self.pull_conversation_history_by(pattern=re.compile(".*"))
+
+        files_dir = self.files_dir()
+        files_dir.mkdir(exist_ok=True)
+        self.pull_all_files(into=files_dir)
 
     @skip_if_exists
     def pull_conversations(self, *, into: Path):
@@ -208,7 +237,6 @@ class JsonSlackExport:
         )
 
         JsonSlackExport._json_dump(into, messages)
-        return messages
 
     @skip_if_exists
     def pull_conversation_metadata(self, conversation: Union[SlackConversation, str], *, into: Path):
@@ -296,7 +324,7 @@ class JsonSlackExport:
         JsonSlackExport._json_dump(into, emojis)
 
     @skip_if_exists
-    def pull_files(self, *, into: Path):
+    def pull_files_meta(self, *, into: Path):
         """Pull server file metadata into file."""
         logger.info("pulling files metadata.")
         files = list_page_endpoint(
@@ -306,6 +334,31 @@ class JsonSlackExport:
             get_page=lambda d: ("page", d["paging"]["page"] + 1)
         )
         JsonSlackExport._json_dump(into, files)
+
+    def pull_all_files(self, *, into: Path):
+        if not into.is_dir():
+            raise ValueError("into must be dir.")
+
+        files = list(self.files())
+        files_len = len(files)
+        for n, slack_file in enumerate(files):
+            out_file = into / f"{slack_file.file_id}.{slack_file.filetype}"
+            if out_file.exists():
+                continue
+            logger.info(f"{n}/{files_len}: {slack_file.filename!r} -> {out_file.as_posix()!r}")
+            self.pull_single_file(out_file, slack_file)
+
+    @sleep_and_retry
+    @limits(calls=1, period=3)  # 20 per minute
+    def pull_single_file(self, into: Path, slack_file: SlackFile):
+        r = requests.get(
+            slack_file.url_private,
+            headers={"Authorization": f"Bearer {self.token}"}
+        )
+        if r.status_code != 200:
+            raise SlackXportException(f"File download failed. HTTP {r.status_code}: {r.text}")
+        with open(into, "xb") as fp:
+            fp.write(r.content)
 
     @staticmethod
     def _json_dump(into, j):
