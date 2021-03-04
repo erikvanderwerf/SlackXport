@@ -4,32 +4,43 @@ import os
 import re
 from functools import wraps
 from pathlib import Path
-from pprint import pprint
 from re import Pattern
-from typing import Iterator, Union
+from typing import Iterator, Union, List
 
 import slack_sdk
 
+from slackxport.slack_conversation import SlackConversation
 
 __all__ = ["JsonSlackExport"]
-
-from slackxport.exceptions import SlackXportException
-from slackxport.slack_channel import SlackChannel
-
 logger = logging.getLogger(__name__)
 
 
 def skip_if_exists(func):
     """Skip decorated execution if argument :into: exists."""
     @wraps(func)
-    def f(*args, **kwargs):
-        kwarg_into = kwargs["into"]
-        if not os.path.exists(kwarg_into):
-            return func(*args, **kwargs)
+    def f(*args, into, **kwargs):
+        if not os.path.exists(into):
+            return func(*args, into=into, **kwargs)
         else:
-            logger.info(f'skipping {func.__name__} for {kwarg_into} because the file exists.')
+            logger.info(f'skipping {func.__name__}({into=}) because the file exists.')
 
     return f
+
+
+def list_page_endpoint(callback, extract, has_more=None, get_cursor=None, args=None, kwargs=None) -> List:
+    has_more = has_more if has_more else lambda d: "" != d.get("response_metadata", {}).get("next_cursor", "")
+    get_cursor = get_cursor if get_cursor else lambda d: d["response_metadata"]["next_cursor"]
+
+    args = args or tuple()
+    kwargs = kwargs or dict()
+
+    data = callback(*args, **kwargs).data
+    lst = extract(data)
+    while has_more(data):
+        cursor = get_cursor(data)
+        data = callback(*args, cursor=cursor, **kwargs).data
+        lst.append(extract(data))
+    return lst
 
 
 class JsonSlackExport:
@@ -40,64 +51,154 @@ class JsonSlackExport:
             token=token,
         )
 
-        self.channels_file = self.root / "channels.json"
-        self.channel_history_dir = self.root / "channel"
+    def conversations_file(self):
+        return self.root / "conversations.json"
 
-    def channels(self) -> Iterator[SlackChannel]:
-        if not self.channels_file.exists() and self.pull_if_not_found:
-            self.pull_channels(self.channels_file)
+    def users_file(self):
+        return self.root / "users.json"
 
-        with open(self.channels_file, 'r') as fp:
+    def conversation_history_dir(self):
+        return self.root / "conversations"
+
+    def conversation(self) -> Iterator[SlackConversation]:
+        if not self.conversations_file().exists() and self.pull_if_not_found:
+            self.pull_conversations(self.conversations_file)
+
+        with open(self.conversations_file(), 'r') as fp:
             j = json.load(fp)
 
-        # pprint(j)
-
         for jc in j:
-            yield SlackChannel(
-                channel_id=jc["id"],
+            yield SlackConversation(
+                conversation_id=jc["id"],
                 name=jc["name"]
             )
 
     def process(self):
-        self.pull_channels(into=self.channels_file)
-        self.pull_channel_history_by(pattern=re.compile(".*"), into=self.channel_history_dir)
+        self.pull_conversations(into=self.conversations_file())
+        self.pull_users(into=self.conversations_file())
+
+        history_dir = self.conversation_history_dir()
+        history_dir.mkdir(exist_ok=True)
+        self.pull_conversation_history_by(pattern=re.compile(".*"), into=history_dir)
 
     @skip_if_exists
-    def pull_channels(self, *, into: Path):
-        """Pull a JSON file of all channels the user belongs to."""
-        data = self.wc.conversations_list().data
-        channels = data["channels"]
-        JsonSlackExport._json_dump(into, channels)
+    def pull_conversations(self, *, into: Path):
+        """Pull a JSON file of all conversation data the user belongs to."""
+        logger.info(f"pulling conversations metadata.")
+        conversations = list_page_endpoint(
+            callback=self.wc.conversations_list,
+            extract=lambda d: d["channels"]
+        )
+        JsonSlackExport._json_dump(into, conversations)
 
-    def pull_channel_history_by(self, pattern: Pattern, into: Path):
-        """Pull history for all channels that match the pattern into a directory with channel-name files."""
-        logger.info(f"pulling channel history that matches {pattern}.")
+    def pull_conversation_history_by(self, pattern: Union[Pattern, str], into: Path, meta=True, members=True):
+        """Pull history for all conversations that match the pattern into a directory with conversation-name files."""
+        logger.info(f"pulling conversation history that matches {pattern.pattern!r}.")
+
+        if isinstance(pattern, str):
+            pattern = re.compile(pattern)
 
         if not into.is_dir():
             raise ValueError("into must be dir.")
+        meta_dir = into / "meta"
+        members_dir = into / "members"
+        # replies_dir = into / "replies"
 
-        for channel in self.channels():
-            if pattern.match(channel.name):
-                self.pull_channel_history(channel=channel, into=into / f"{channel.name}.json")
+        if meta:
+            meta_dir.mkdir(exist_ok=True)
+        if members:
+            members_dir.mkdir(exist_ok=True)
+        # if replies:
+        #     replies_dir.mkdir(exist_ok=True)
+
+        for conversation in self.conversation():
+            if pattern.match(conversation.name):
+                self.pull_conversation_history(conversation=conversation, into=into / f"{conversation.name}.json")
+                if meta:
+                    self.pull_conversation_metadata(
+                        conversation=conversation,
+                        into=meta_dir / f"{conversation.name}.meta.json"
+                    )
+                if members:
+                    self.pull_conversation_members(
+                        conversation=conversation,
+                        into=members_dir / f"{conversation.name}.members.json"
+                    )
+                # if replies:
+                #     self.pull_conversation_replies(
+                #         channel=conversation,
+                #         into=replies_dir / f"{conversation.name}.replies.json"
+                #     )
 
     @skip_if_exists
-    def pull_channel_history(self, channel: Union[SlackChannel, str], *, into: Path):
-        """Pull history for a specific channel into a file."""
-        logger.info(f"pulling history for {channel}")
+    def pull_conversation_history(self, conversation: Union[SlackConversation, str], *, into: Path):
+        """Pull history for a specific conversation into a file."""
+        logger.info(f"pulling conversation history for {conversation}.")
 
-        if isinstance(channel, SlackChannel):
-            channel = channel.channel_id
+        if isinstance(conversation, SlackConversation):
+            conversation = conversation.conversation_id
 
-        data = self.wc.conversations_history(channel=channel).data
-        messages = data["messages"]
+        messages = list_page_endpoint(
+            callback=self.wc.conversations_history,
+            kwargs={'channel': conversation},
+            extract=lambda d: d["messages"],
+        )
 
-        while data["has_more"] is True:
-            cursor = data["response_metadata"]["next_cursor"]
-            data = self.wc.conversations_history(channel=channel, cursor=cursor).data
-            messages.append(data["messages"])
+        JsonSlackExport._json_dump(into, messages)
 
-        self._json_dump(into, messages)
+    @skip_if_exists
+    def pull_conversation_metadata(self, conversation: Union[SlackConversation, str], *, into: Path):
+        """Pull metadata for a specific conversation into a file."""
+        logger.info(f"pulling conversation metadata for {conversation}.")
 
+        if isinstance(conversation, SlackConversation):
+            conversation = conversation.conversation_id
+
+        metadata = list_page_endpoint(
+            callback=self.wc.conversations_info,
+            kwargs={'channel': conversation},
+            extract=lambda d: d["channel"],
+        )
+
+        JsonSlackExport._json_dump(into, metadata)
+
+    @skip_if_exists
+    def pull_conversation_members(self, conversation: Union[SlackConversation, str], *, into: Path):
+        """Pull members for a specific conversation into a file."""
+        logger.info(f"pulling conversation members for {conversation}.")
+
+        if isinstance(conversation, SlackConversation):
+            conversation = conversation.conversation_id
+
+        members = list_page_endpoint(
+            callback=self.wc.conversations_members,
+            kwargs={'channel': conversation},
+            extract=lambda d: d["members"],
+        )
+
+        JsonSlackExport._json_dump(into, members)
+
+    # @skip_if_exists
+    # def pull_conversation_replies(self, conversation: Union[SlackConversation, str], *, into: Path):
+    #     logger.info(f"pulling replies for {conversation}.")
+    #
+    #     if isinstance(conversation, SlackConversation):
+    #         conversation = conversation.conversation_id
+    #
+    #
+    #
+    #     JsonSlackExport._json_dump(into, replies)
+
+    @skip_if_exists
+    def pull_users(self, *, into: Path):
+        """Pull user metadata into file."""
+        logger.info("pulling users metadata.")
+        users = list_page_endpoint(
+            callback=self.wc.users_list,
+            extract=lambda d: d["members"]
+        )
+
+        JsonSlackExport._json_dump(into, users)
 
     @staticmethod
     def _json_dump(into, j):
