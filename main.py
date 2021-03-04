@@ -1,5 +1,4 @@
 import logging
-import re
 from pathlib import Path
 
 from slackxport import JsonSlackExport
